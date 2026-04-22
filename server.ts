@@ -147,15 +147,18 @@ async function getTranscriptFallback(videoId: string) {
   }
 }
 
-export async function createExpressApp() {
+async function startServer() {
   const app = express();
+  const PORT = 3000;
+
   app.use(express.json());
 
-  // Ensure DB exists (Note: ephemeral on Vercel)
+  // Ensure DB exists
   try {
-    const data = await fs.readFile(DB_PATH, 'utf-8').catch(() => '[]');
-    if (data === '[]') await fs.writeFile(DB_PATH, '[]');
-  } catch (e) {}
+    await fs.access(DB_PATH);
+  } catch {
+    await fs.writeFile(DB_PATH, JSON.stringify([]));
+  }
 
   // History API
   app.get("/api/history", async (req, res) => {
@@ -163,26 +166,28 @@ export async function createExpressApp() {
       const data = await fs.readFile(DB_PATH, 'utf-8');
       res.json(JSON.parse(data));
     } catch (error) {
-      res.json([]);
+      res.status(500).json({ error: "Failed to read history" });
     }
   });
 
   app.post("/api/history", async (req, res) => {
     try {
       const newItem = req.body;
-      const data = await fs.readFile(DB_PATH, 'utf-8').catch(() => '[]');
+      const data = await fs.readFile(DB_PATH, 'utf-8');
       const history = JSON.parse(data);
       
+      // Update if exists (by video URL of primary video)
       const existingIdx = history.findIndex((h: any) => h.id === newItem.id);
       if (existingIdx > -1) {
         history[existingIdx] = newItem;
       } else {
+        // Keep unique by videoId if possible
         history.unshift(newItem);
       }
       
+      // Limit to 50 items
       const limitedHistory = history.slice(0, 50);
-      // On Vercel, this might fail or be transient
-      await fs.writeFile(DB_PATH, JSON.stringify(limitedHistory, null, 2)).catch(() => {});
+      await fs.writeFile(DB_PATH, JSON.stringify(limitedHistory, null, 2));
       res.json({ success: true });
     } catch (error) {
       res.status(500).json({ error: "Failed to save history" });
@@ -190,20 +195,26 @@ export async function createExpressApp() {
   });
 
   app.get("/api/test-route", (req, res) => {
-    res.json({ status: "LeanTube Vercel Backend is running" });
+    res.json({ status: "new server is running" });
   });
 
   // API Route: Get YouTube Transcript and Metadata
   app.get("/api/youtube/data", async (req, res) => {
     const videoUrl = req.query.url as string;
-    if (!videoUrl) return res.status(400).json({ error: "Missing video URL" });
+    if (!videoUrl) {
+      return res.status(400).json({ error: "Missing video URL" });
+    }
 
     try {
+      // Extract video ID
       const videoIdMatch = videoUrl.match(/(?:https?:\/\/)?(?:www\.)?(?:youtube\.com\/(?:[^\/\n\s]+\/\S+\/|(?:v|e(?:mbed)?)\/|\S*?[?&]v=)|youtu\.be\/)([a-zA-Z0-9_-]{11})/);
       const videoId = videoIdMatch ? videoIdMatch[1] : null;
 
-      if (!videoId) throw new Error("Invalid YouTube URL");
+      if (!videoId) {
+        throw new Error("Invalid YouTube URL");
+      }
 
+      // 1. Get Metadata via OEmbed (with fallback)
       let metadata = { 
         title: "未知视频",
         author_name: "未知作者",
@@ -220,24 +231,35 @@ export async function createExpressApp() {
             thumbnail_url: metaResponse.data.thumbnail_url || metadata.thumbnail_url
           };
         }
-      } catch (metaErr) {}
+      } catch (metaErr) {
+        console.warn("[API] Failed to fetch oEmbed metadata, using fallback", metaErr);
+      }
 
+      // 2. Get Transcript Aggressively
       let fullTranscript = "";
       let hasTranscript = false;
+
+      console.log(`[API] Fetching transcript for ${videoId}...`);
       
+      // Try primary method first
       try {
         if (YoutubeTranscript?.fetchTranscript) {
           const transcriptItems = await YoutubeTranscript.fetchTranscript(videoId);
           fullTranscript = transcriptItems.map((item: any) => item.text).join(" ");
           hasTranscript = true;
+          console.log(`[API] Primary transcript engine: SUCCESS for ${videoId}`);
         }
-      } catch (e) {}
+      } catch (e) {
+        console.log(`[API] Primary engine restricted for ${videoId}, engaging deep-scrape fallback...`);
+      }
 
+      // Fallback if primary failed
       if (!hasTranscript) {
         const fallbackTranscript = await getTranscriptFallback(videoId);
         if (fallbackTranscript) {
           fullTranscript = fallbackTranscript;
           hasTranscript = true;
+          console.log(`[API] Aggressive fallback transcript fetch success for ${videoId}`);
         }
       }
 
@@ -245,6 +267,7 @@ export async function createExpressApp() {
         fullTranscript = "【系统提示：字幕获取受限】由于 YouTube 的保护机制或字幕未公开，目前无法直接提取全文。LeanTube 已开启语义推演模式。";
       }
 
+      console.log(`[API] Sending response for ${videoId}...`);
       res.json({
         title: metadata.title,
         author: metadata.author_name,
@@ -254,16 +277,12 @@ export async function createExpressApp() {
         videoId
       });
     } catch (error: any) {
-      res.status(500).json({ error: error?.message || "Failed to fetch YouTube data" });
+      console.error("\n\n=== [API] OUTER FETCH ERROR ===");
+      console.error(error);
+      console.error("================================\n\n");
+      res.status(500).json({ error: error?.message || error || "Failed to fetch YouTube data" });
     }
   });
-
-  return app;
-}
-
-async function startServer() {
-  const app = await createExpressApp();
-  const PORT = 3000;
 
   // Vite middleware for development
   if (process.env.NODE_ENV !== "production") {
@@ -275,9 +294,7 @@ async function startServer() {
   } else {
     const distPath = path.join(process.cwd(), 'dist');
     app.use(express.static(distPath));
-    app.get('*', (req, res, next) => {
-      // Don't intercept API calls
-      if (req.path.startsWith('/api')) return next();
+    app.get('*', (req, res) => {
       res.sendFile(path.join(distPath, 'index.html'));
     });
   }
@@ -287,8 +304,4 @@ async function startServer() {
   });
 }
 
-// Only auto-start if not being imported (Vercel imports it)
-if (process.env.NODE_ENV !== "production" || !process.env.VERCEL) {
-  startServer();
-}
-
+startServer();
